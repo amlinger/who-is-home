@@ -108,6 +108,11 @@ setInterval(() => {
     connection.end()
   })
 
+  connection.on('error', function() {
+    console.error('Error event was emited with arguments: ' + arguments)
+    // close should be automatically called here.
+  })
+
   connection.on('close', function() {
     console.info('Telnet connection to router closed')
     console.timeEnd(TIMER_LABEL)
