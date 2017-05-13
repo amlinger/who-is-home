@@ -1,7 +1,6 @@
 const express = require('express')
-const exec = require('child_process').exec;
-
-const app = express()
+const telnet  = require('telnet-client')
+const exec    = require('child_process').exec
 
 const cliArgs = process.argv.slice(2)
 
@@ -12,95 +11,121 @@ if (cliArgs.some(arg => !arg.includes('='))) {
 
 const cli = cliArgs.reduce((obj, pair) => {
   const [key, val] = pair.split('=')
-  if (!['interval', 'ip_range', 'port'].includes(key)) return obj
   return Object.assign(obj, {[key]: val})
 }, {})
 
-const UPDATE_INTERVAL = parseInt(cli.interval) || 5000
-const IP_RANGE        = cli.ip_range           || '192.168.1.1/24'
-const PORT            = parseInt(cli.port)     || 3000
+const USERNAME        = cli.telnet_username         || process.env.TELNET_USERNAME
+const PASSWORD        = cli.telnet_password         || process.env.TELNET_PASSWORD
+const UPDATE_INTERVAL = parseInt(cli.interval       || process.env.INTERVAL      )        || 10000
+const PORT            = parseInt(cli.port           || process.env.PORT          )        || 3000
+const TELNET_PORT     = parseInt(cli.telnet_port    || process.env.TELNET_PORT   )        || 23
+const TELNET_TIMEOUT  = parseInt(cli.telnet_timeout || process.env.TELNET_TIMEOUT)        || 1000
+const TELNET_HOST     = cli.telnet_host             || process.env.TELNET_HOST            || '192.168.1.1'
+const LOGIN_PROMPT    = cli.telnet_login_prompt     || process.env.TELNET_LOGIN_PROMPT    || 'RT-N66U login: '
+const PASSWORD_PROMPT = cli.telnet_password_prompt  || process.env.TELNET_PASSWORD_PROMPT || 'Password: '
+const ARP_LOCATION    = cli.arp_location            || process.env.ARP_LOCATION           || '/proc/net/arp'
 
-var arpTable = {}
+if (USERNAME === undefined || PASSWORD === undefined) {
+  console.error('Need to specify username and password to access router')
+  process.exit(0)
+}
+
+// App and the in-memory cache for the IP addresses present on the network
+const app = express()
+let ipMap = {}
+
+// Timer label to time execution for the Telnet connection
+const TIMER_LABEL = 'Telnet connection latency'
+
 setInterval(() => {
-  /* On an interval basis, execute an ARP lookup for the locally stored cache,
-   * between IP addresses and MAC-addresses. This splits the output of the
-   * arp command and processes line by line each entry, that is expected to
-   * be on the form:
-   * name (192.168.0.127) at ac:5f:3e:36:77:a9 on en0 ifscope [ethernet]
-   *
-   * As bot IP and MAC address may be surrounded by parantheses, it is made
-   * sure that these are removed before populating the arpMap object. The
-   * arpMap object is also cleared, so that cache updates is reflected here
-   * as well.
+  const connection = new telnet()
+  console.time(TIMER_LABEL)
+  /* We've successfylly esptablished a connection to the router.
    */
-   exec("arp -a", (error, result, stderr) => {
-    arpTable = {}
-    result.split('\n')
-      .filter(line => line != "")
-      .forEach(line => {
-        let [name, ip, _, mac, __] = line.split(' ')
-        ip = ip.replace(/\(|\)/g, '')
-        mac = mac.replace(/\(|\)/g, '')
-        arpTable[ip] = {name, mac}
-      })
+  connection.on('ready', function(prompt) {
+    console.log('Telnet connection to router open')
+    /* The ARP table is stored in /proc/net/arp on the RT-N66U Asus router, so
+     * we reed that and parse it's contents.
+     */
+    connection.exec(`cat ${ARP_LOCATION}`, (err, response) => {
+      if (err) {
+        console.error('Failed to execute ARP read on router' + err)
+        return connection.end()
+      }
+
+      const lines = response.split('\n')
+
+      // Pop the first line in the array, and use that for header values. We
+      // expect headers to be separated by more than one whitespace. For the
+      // remaining values, replace the whitespaces with
+      const headers = lines.shift().split(/\s\s+/).map(
+          h => h.toLowerCase().replace(' ', '_'))
+
+      const newIpMap = lines.reduce((accumulator, line) => {
+        const parts = line.split(/\s+/),
+          ipAddress = parts[0],
+          // There might already be an object that we are interested in for
+          // this entry.
+          obj = ipMap[ipAddress] || {}
+
+          // TODO: Enable cache invalidation of name here as well.
+          if (obj.name === undefined) {
+            // Refresh our cached value
+
+            exec(`nslookup ${ipAddress}` , (err, result, stderr) => {
+              if (err) {
+                return console.error('nslookup failure for IP ' + ipAddress)
+              }
+
+              const res = result.match(/name\ =\ .*\./)
+              obj.name = res ? res[0].split(' = ')[1].replace('.', '') : ''
+            })
+          }
+
+          // Assign the restp of the properties to the object
+          for (let j = 0; j < headers.length; j++) {
+            obj[headers[j]] = parts[j]
+          }
+
+          accumulator[ipAddress] = obj
+          return accumulator
+      }, {})
+
+      ipMap = newIpMap
+      // Make sure to close the connection when we are done.
+      connection.end()
+    })
+  })
+
+  connection.on('failedLogin', function(prompt) {
+    console.error(
+      'Failed to login, please verify your credentials/promt settings')
+    connection.end()
+  })
+
+  connection.on('timeout', function() {
+    console.error('Telnet socket timeout')
+    connection.end()
+  })
+
+  connection.on('close', function() {
+    console.info('Telnet connection to router closed')
+    console.timeEnd(TIMER_LABEL)
+  })
+
+  connection.connect({
+    host:           TELNET_HOST,
+    port:           TELNET_PORT,
+    username:       USERNAME,
+    password:       PASSWORD,
+    loginPrompt:    LOGIN_PROMPT,
+    passwordPrompt: PASSWORD_PROMPT,
+    timeout:        TELNET_TIMEOUT,
   })
 }, UPDATE_INTERVAL)
 
-var ipMap = {}
-setInterval(() => {
-  /* On an interval basis, execute an nmap lookup for the devices on the
-   * network. This splits the output of the nmap command and processes line
-   * by line each entry, that is expected to be on the form:
-   * Starting Nmap 7.12 ( https://nmap.org ) at 2017-02-26 17:15 GMT
-   *
-   *
-   * The name might be missing, in that case we fall back to any existing
-   * lower-case name from the ARP map
-   * As the IP address may be surrounded by parentatheses, we make sure to
-   * remove them from the IP.
-   * The ipMap object is cleared, so that devices can leave the network.
-   */
-  exec(`nmap -sP ${IP_RANGE}` , (error, result, stderr) => {
-    ipMap = {}
-    result
-      .split('\n')
-      .filter(line => !["Starting Nmap", "Nmap done", "Host is up"].some(
-            w => line.includes(w)))
-      .map(line => line.replace(/^Nmap scan report for /, ''))
-      .filter(line => line != "")
-      .forEach(line => {
-        let [name, ip] = line.split(' ')
-        if (ip == undefined) {
-          ip = name
-          name = arpTable[ip] ? arpTable[ip].name : '?'
-        } else {
-          ip = ip.replace(/\(|\)/g, '')
-        }
-
-        ipMap[ip] = Object.assign({}, arpTable[ip], {name, ip})
-      })
-  })
-}, UPDATE_INTERVAL)
-
-// Helpful message when pointing to the root.
-app.get('/', (_, res) => res.send('Supported GET operations: [' +
-      '<a href="/ip">IP</a>, <a href="mac">MAC</a>]'))
-
-/* Returns all known IPs at this moment, or at least since the last lookup
- * nmap and arp. */
-app.get('/ip', (_, res) => res.send(ipMap))
-
-/* Flips the map to contain MAC addresses as keys in the lookup map. This
- * filters out entries that contain no known MAC address. */
-app.get('/mac', (req, res) => {
-  const macMap = {}
-  Object.keys(ipMap)
-    .map(key => ipMap[key])
-    .filter(item => !!item.mac)
-    .forEach(item => { macMap[item.mac] = item; })
-
-  res.send(macMap)
+app.get('/ip', (req, res) => {
+  res.send(ipMap)
 })
 
 app.listen(PORT, '0.0.0.0')
-
